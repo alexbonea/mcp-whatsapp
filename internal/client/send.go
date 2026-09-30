@@ -234,19 +234,26 @@ func (c *Client) attachMedia(ctx context.Context, msg *waProto.Message, mediaPat
 		}
 	case whatsmeow.MediaDocument:
 		// View-once on documents is not supported by WhatsApp clients; silently ignored.
-		msg.DocumentMessage = &waProto.DocumentMessage{
-			Title:         proto.String(filepath.Base(mediaPath)),
-			Caption:       proto.String(caption),
-			Mimetype:      proto.String(mimeType),
-			URL:           &resp.URL,
-			DirectPath:    &resp.DirectPath,
-			MediaKey:      resp.MediaKey,
-			FileEncSHA256: resp.FileEncSHA256,
-			FileSHA256:    resp.FileSHA256,
-			FileLength:    &resp.FileLength,
-		}
+		msg.DocumentMessage = documentMessage(mediaPath, caption, mimeType, resp)
 	}
 	return nil
+}
+
+// WhatsApp clients use FileName, not Title, to save and open attachments.
+func documentMessage(path, caption, mimeType string, resp whatsmeow.UploadResponse) *waProto.DocumentMessage {
+	name := filepath.Base(path)
+	return &waProto.DocumentMessage{
+		Title:         proto.String(name),
+		FileName:      proto.String(name),
+		Caption:       proto.String(caption),
+		Mimetype:      proto.String(mimeType),
+		URL:           &resp.URL,
+		DirectPath:    &resp.DirectPath,
+		MediaKey:      resp.MediaKey,
+		FileEncSHA256: resp.FileEncSHA256,
+		FileSHA256:    resp.FileSHA256,
+		FileLength:    &resp.FileLength,
+	}
 }
 
 // mediaTypeFromExt maps a file extension to a whatsmeow MediaType + mime type.
@@ -272,6 +279,8 @@ func mediaTypeFromExt(path string) (whatsmeow.MediaType, string) {
 		return whatsmeow.MediaVideo, "video/avi"
 	case "mov":
 		return whatsmeow.MediaVideo, "video/quicktime"
+	case "docx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 	default:
 		return whatsmeow.MediaDocument, "application/octet-stream"
 	}

@@ -4,6 +4,7 @@
 //	login  — one-shot interactive QR pairing (writes session to store/whatsapp.db)
 //	serve  — long-running HTTP daemon: serves MCP at /mcp and pairing UI at /pair
 //	smoke  — non-interactive boot-check used by CI (no network, no listener)
+//	outbound — stage, verify and clean up copies in the outbound root
 package main
 
 import (
@@ -27,6 +28,7 @@ Commands:
   login   Pair this device with your WhatsApp account via QR code (terminal)
   serve   Run the always-on HTTP MCP daemon (tracks events + serves MCP on 127.0.0.1:8765)
   smoke   Non-interactive boot check (CI): opens store + builds MCP server without connecting
+  outbound Stage, verify and clean up document copies for send_file (see "outbound help")
   help    Show this help
 
 Global flags (before the command):
@@ -37,6 +39,12 @@ Global flags (before the command):
 Serve-specific flags (after 'serve'):
   -addr host:port   HTTP bind address (default: 127.0.0.1:8765, env WHATSAPP_MCP_ADDR)
   -allow-remote     Allow binding to a non-loopback address (dangerous)
+
+Media roots (environment):
+  WHATSAPP_MCP_MEDIA_ROOT     download_media output_path; also send media_path
+                              unless WHATSAPP_MCP_OUTBOUND_ROOT is set
+  WHATSAPP_MCP_OUTBOUND_ROOT  dedicated 0700 directory that becomes the only
+                              root send_file / send_audio_message read from
 `
 
 func main() {
@@ -87,6 +95,8 @@ func main() {
 		code = runServe(storeDir, redactor, rest)
 	case "smoke":
 		code = runSmoke(storeDir, redactor, rest)
+	case "outbound":
+		code = runOutbound(rest, os.Stdout, os.Stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(os.Stdout, usage)
 		code = 0

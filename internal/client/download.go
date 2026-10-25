@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/sealjay/mcp-whatsapp/internal/security"
 	"go.mau.fi/whatsmeow"
@@ -53,10 +53,10 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	// Validate output_path first so a bad path fails the call before any DB
 	// or network work. The skip-if-exists check waits until after we have
 	// the media metadata (so the success response carries the right fields).
-	var resolvedOutput string
+	var resolvedOutput *security.Target
 	if outputPath != "" {
 		var err error
-		resolvedOutput, err = c.ValidateOutputPath(outputPath)
+		resolvedOutput, err = c.ResolveOutputPath(outputPath)
 		if err != nil {
 			return DownloadResult{Success: false, Message: err.Error()}
 		}
@@ -79,16 +79,25 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 	}
 
 	// Skip-if-exists at the caller's destination: symmetric with the cache
-	// short-circuit below. Idempotent re-calls are a no-op.
-	if resolvedOutput != "" {
-		if _, statErr := os.Stat(resolvedOutput); statErr == nil {
+	// short-circuit below. Idempotent re-calls are a no-op. Only a regular
+	// file counts: a symlink there (Syncthing replicates symlinks from the
+	// other Mac) would make the result, and the inline bytes read from it,
+	// point at a file outside the media root.
+	if resolvedOutput != nil {
+		info, statErr := resolvedOutput.Lstat()
+		switch {
+		case statErr == nil && info.Mode().IsRegular():
 			return DownloadResult{
 				Success:   true,
 				Message:   fmt.Sprintf("Successfully downloaded %s media", mediaType),
 				MediaType: mediaType,
 				Filename:  filename,
-				Path:      resolvedOutput,
+				Path:      resolvedOutput.Path,
 			}
+		case statErr == nil:
+			return DownloadResult{Success: false, Message: fmt.Sprintf("output_path %q already exists and is not a regular file; choose a new filename", resolvedOutput.Path)}
+		case !errors.Is(statErr, fs.ErrNotExist):
+			return DownloadResult{Success: false, Message: fmt.Sprintf("inspect output_path: %v", statErr)}
 		}
 	}
 
@@ -166,13 +175,13 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 // and builds the success DownloadResult. Shared by the cache-hit and
 // fresh-download paths in Download, which differ only in the log line
 // emitted just before this call.
-func finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename string) DownloadResult {
+func finalizeDownload(localPath, absPath string, resolvedOutput *security.Target, mediaType, filename string) DownloadResult {
 	returnPath := absPath
-	if resolvedOutput != "" {
+	if resolvedOutput != nil {
 		if err := placeAtOutput(localPath, resolvedOutput); err != nil {
 			return DownloadResult{Success: false, Message: fmt.Sprintf("failed to write output_path: %v", err)}
 		}
-		returnPath = resolvedOutput
+		returnPath = resolvedOutput.Path
 	}
 	return DownloadResult{
 		Success:   true,
@@ -183,36 +192,38 @@ func finalizeDownload(localPath, absPath, resolvedOutput, mediaType, filename st
 	}
 }
 
-// placeAtOutput materialises src at dst. Prefers a hard link (zero-copy, O(1))
-// and falls back to a stream copy on cross-device (EXDEV). If dst already
-// exists, returns nil — the caller has already cleared the skip-if-exists
-// check, so EEXIST here is a benign race and the file satisfies the request.
-func placeAtOutput(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	} else if errors.Is(err, syscall.EEXIST) {
-		return nil
-	} else if !errors.Is(err, syscall.EXDEV) {
-		return err
-	}
-	// Cross-device — fall back to a copy.
+// placeAtOutput writes an independent copy of src at dst. Unlike the hard
+// link earlier versions made, the copy shares no inode with the private
+// cache, so edits, permission changes or moves of the materialised file
+// never reach the cache. The file is created exclusively inside the media
+// root; if something already sits at dst (a concurrent call won the race),
+// a regular file satisfies the request and anything else is an error.
+func placeAtOutput(src string, dst *security.Target) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if errors.Is(err, syscall.EEXIST) {
+	out, err := dst.CreateExclusive()
+	if errors.Is(err, fs.ErrExist) {
+		if info, lerr := dst.Lstat(); lerr == nil && info.Mode().IsRegular() {
 			return nil
 		}
+		return fmt.Errorf("%q already exists and is not a regular file", dst.Path)
+	}
+	if err != nil {
 		return err
 	}
-	defer out.Close()
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = dst.Remove()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		_ = dst.Remove()
+		return err
+	}
+	return nil
 }
 
 // preferredDirectPath picks the value handed to whatsmeow as the download's

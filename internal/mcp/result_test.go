@@ -11,7 +11,18 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/sealjay/mcp-whatsapp/internal/client"
+	"github.com/sealjay/mcp-whatsapp/internal/security"
 )
+
+// testOpen stands in for client.OpenDownloadedMedia with the temp
+// directory as the root: regular files only, final symlinks refused.
+func testOpen(path string) (*os.File, error) {
+	tgt, err := security.ResolveTarget("path", path, os.TempDir())
+	if err != nil {
+		return nil, err
+	}
+	return tgt.OpenRegular()
+}
 
 // jpegMagic is the minimum prefix (SOI + APP0 marker) that
 // http.DetectContentType recognises as image/jpeg.
@@ -74,7 +85,7 @@ func TestDownloadMediaResult_ImageInlined(t *testing.T) {
 		Path:      path,
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -111,7 +122,7 @@ func TestDownloadMediaResult_AudioInlined(t *testing.T) {
 		Path:      path,
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -140,7 +151,7 @@ func TestDownloadMediaResult_DocumentPathOnly(t *testing.T) {
 		Path:      path,
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -162,7 +173,7 @@ func TestDownloadMediaResult_VideoPathOnly(t *testing.T) {
 		Path:      path,
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -180,7 +191,7 @@ func TestDownloadMediaResult_FailurePathOnly(t *testing.T) {
 		Message: "failed to download media: download failed with status code 403",
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -202,7 +213,7 @@ func TestDownloadMediaResult_MissingFileFallsBack(t *testing.T) {
 		Path:      filepath.Join(t.TempDir(), "does-not-exist.jpg"),
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
@@ -230,11 +241,30 @@ func TestDownloadMediaResult_OversizedNotInlined(t *testing.T) {
 		Path:      path,
 	}
 
-	res, err := downloadMediaResult(r)
+	res, err := downloadMediaResult(r, testOpen)
 	if err != nil {
 		t.Fatalf("downloadMediaResult: %v", err)
 	}
 	if len(res.Content) != 1 {
 		t.Fatalf("expected 1 content block for oversized file, got %d", len(res.Content))
+	}
+}
+
+// TestDownloadMediaResult_SymlinkNotInlined: a Path that is a symlink is
+// never read for the inline block, even when its target is a valid image,
+// so a link planted at output_path cannot exfiltrate another file.
+func TestDownloadMediaResult_SymlinkNotInlined(t *testing.T) {
+	secret := writeFile(t, "id_ed25519", append(append([]byte(nil), jpegMagic...), []byte("PRIVATE")...))
+	link := filepath.Join(t.TempDir(), "photo.jpg")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Fatal(err)
+	}
+	r := client.DownloadResult{Success: true, Message: "ok", MediaType: "image", Filename: "photo.jpg", Path: link}
+	res, err := downloadMediaResult(r, testOpen)
+	if err != nil {
+		t.Fatalf("downloadMediaResult: %v", err)
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("symlinked path was inlined (%d blocks)", len(res.Content))
 	}
 }

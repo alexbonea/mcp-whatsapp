@@ -65,17 +65,19 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		fmt.Fprintf(os.Stderr, "resolve store dir: %v\n", err)
 		return 1
 	}
-	allowedMediaRoot := os.Getenv("WHATSAPP_MCP_MEDIA_ROOT")
-	if allowedMediaRoot == "" {
-		allowedMediaRoot = filepath.Join(absStore, "uploads")
+	roots, err := resolveMediaRoots(absStore, os.Getenv("WHATSAPP_MCP_MEDIA_ROOT"), os.Getenv("WHATSAPP_MCP_OUTBOUND_ROOT"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "refusing to start: %v\n", err)
+		return 2
 	}
-	allowedMediaRoot = filepath.Clean(allowedMediaRoot)
-	if mkErr := os.MkdirAll(allowedMediaRoot, 0o755); mkErr != nil {
-		fmt.Fprintf(os.Stderr, "warn: could not create media root %q: %v\n", allowedMediaRoot, mkErr)
+	// Operator UX: make the roots obvious on boot so users know where
+	// received media lands and where outbound attachments must sit.
+	if roots.outbound == "" {
+		fmt.Fprintf(os.Stderr, "media root: %s (download_media output_path and outbound media_path; set WHATSAPP_MCP_OUTBOUND_ROOT to give sends their own root)\n", roots.inbound)
+	} else {
+		fmt.Fprintf(os.Stderr, "media root: %s (download_media output_path only)\n", roots.inbound)
+		fmt.Fprintf(os.Stderr, "outbound root: %s (send_file and send_audio_message media_path; stage copies with `whatsapp-mcp outbound stage`)\n", roots.outbound)
 	}
-	// Operator UX: make the media root obvious on boot so users know where
-	// to drop outbound attachments.
-	fmt.Fprintf(os.Stderr, "media root: %s (drop outbound files here)\n", allowedMediaRoot)
 
 	st, err := store.Open(storeDir)
 	if err != nil {
@@ -88,7 +90,8 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		StoreDir:         storeDir,
 		Store:            st,
 		Logger:           client.NewStderrLogger("Client", "INFO", false),
-		AllowedMediaRoot: allowedMediaRoot,
+		AllowedMediaRoot: roots.inbound,
+		OutboundRoot:     roots.outbound,
 		Redactor:         redactor,
 	})
 	if err != nil {
@@ -123,6 +126,46 @@ func runServe(storeDir string, redactor *security.Redactor, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// mediaRoots holds the inbound media root and the optional dedicated
+// outbound root.
+type mediaRoots struct {
+	inbound  string // download_media output_path; also send media_path when outbound is empty
+	outbound string // symlink-resolved WHATSAPP_MCP_OUTBOUND_ROOT, or empty for the legacy single root
+}
+
+// resolveMediaRoots applies the root configuration. WHATSAPP_MCP_MEDIA_ROOT
+// keeps its legacy meaning and defaults; a missing directory is created
+// best-effort. WHATSAPP_MCP_OUTBOUND_ROOT, when set, becomes the only root
+// sends read from and must be a dedicated private directory: it may not
+// contain home, the store or a system temp directory, may not overlap the
+// media root, and must be (or is created as) a 0700 directory of this user.
+func resolveMediaRoots(absStore, mediaEnv, outboundEnv string) (mediaRoots, error) {
+	inbound := mediaEnv
+	if inbound == "" {
+		inbound = filepath.Join(absStore, "uploads")
+	}
+	inbound = filepath.Clean(inbound)
+	if mkErr := os.MkdirAll(inbound, 0o755); mkErr != nil {
+		fmt.Fprintf(os.Stderr, "warn: could not create media root %q: %v\n", inbound, mkErr)
+	}
+	if outboundEnv == "" {
+		return mediaRoots{inbound: inbound}, nil
+	}
+	var protected []string
+	if home, err := os.UserHomeDir(); err == nil {
+		protected = append(protected, home)
+	}
+	protected = append(protected, absStore, os.TempDir(), "/tmp", "/var/tmp")
+	outbound, err := security.PrepareDedicatedRoot("WHATSAPP_MCP_OUTBOUND_ROOT", outboundEnv, security.DedicatedRootPolicy{
+		Protected: protected,
+		Disjoint:  []string{inbound},
+	})
+	if err != nil {
+		return mediaRoots{}, err
+	}
+	return mediaRoots{inbound: inbound, outbound: outbound}, nil
 }
 
 // resolveAddr applies the -addr / WHATSAPP_MCP_ADDR / default precedence.

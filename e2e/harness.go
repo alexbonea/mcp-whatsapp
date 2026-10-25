@@ -29,23 +29,20 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	repo := repoRoot(t)
-	bin := filepath.Join(repo, "bin", "whatsapp-mcp")
+	return newHarnessEnv(t)
+}
+
+// newHarnessEnv is newHarness with extra KEY=value environment entries for
+// the daemon (e.g. the media roots).
+func newHarnessEnv(t *testing.T, env ...string) *harness {
+	t.Helper()
+	bin := binary(t)
 	storeDir := t.TempDir()
 	port := freePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
-	// Build if missing.
-	if _, err := os.Stat(bin); os.IsNotExist(err) {
-		build := exec.Command("make", "build")
-		build.Dir = repo
-		build.Stdout, build.Stderr = os.Stderr, os.Stderr
-		if err := build.Run(); err != nil {
-			t.Fatalf("make build: %v", err)
-		}
-	}
-
 	cmd := exec.Command(bin, "-store", storeDir, "serve", "-addr", addr)
+	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -57,6 +54,22 @@ func newHarness(t *testing.T) *harness {
 
 	h.waitForReady(5 * time.Second)
 	return h
+}
+
+// binary returns ./bin/whatsapp-mcp, building it if missing.
+func binary(t *testing.T) string {
+	t.Helper()
+	repo := repoRoot(t)
+	bin := filepath.Join(repo, "bin", "whatsapp-mcp")
+	if _, err := os.Stat(bin); os.IsNotExist(err) {
+		build := exec.Command("make", "build")
+		build.Dir = repo
+		build.Stdout, build.Stderr = os.Stderr, os.Stderr
+		if err := build.Run(); err != nil {
+			t.Fatalf("make build: %v", err)
+		}
+	}
+	return bin
 }
 
 func freePort(t *testing.T) int {

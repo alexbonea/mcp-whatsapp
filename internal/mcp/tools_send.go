@@ -3,7 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
-	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -66,9 +66,9 @@ type sendFileArgs struct {
 
 func (s *Server) registerSendFile() {
 	tool := mcp.NewTool("send_file",
-		mcp.WithDescription("Upload and send a picture, video, document, or raw audio attachment via WhatsApp; the recipient sees a media message and the outgoing row is persisted to the local cache. Reversible via delete_message (revoke). For voice notes use send_audio_message (which transcodes to ogg/opus); for plain text use send_message. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+		mcp.WithDescription("Upload and send a picture, video, document, or raw audio attachment via WhatsApp; the recipient sees a media message (documents keep the file's name) and the outgoing row is persisted to the local cache. Reversible via delete_message (revoke). For voice notes use send_audio_message (which transcodes to ogg/opus); for plain text use send_message. Returns a JSON object `{Success, Message, ID, FileSHA256, FileLength}` where `ID` is the WhatsApp message ID and `FileSHA256`/`FileLength` describe the uploaded bytes; `Uncertain: true` on a failure means WhatsApp did not confirm and the message may still have gone out, so do not resend automatically."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
-		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the media file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
+		mcp.WithString("media_path", mcp.Required(), mcp.Description(mediaPathDesc("media file"))),
 		mcp.WithString("caption", mcp.Description("optional caption for image/video/document submessages; ignored for raw audio")),
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
 		mcp.WithBoolean("view_once", mcp.DefaultBool(false), mcp.Description("if true, mark image/video/audio submessages as view-once; silently ignored for documents (defaults to false)")),
@@ -81,20 +81,26 @@ func (s *Server) registerSendFile() {
 		if a.Recipient == "" || a.MediaPath == "" {
 			return mcp.NewToolResultError("recipient and media_path are required"), nil
 		}
-		safePath, err := s.client.ValidateMediaPath(a.MediaPath)
+		m, err := s.client.OpenOutboundMedia(a.MediaPath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		defer m.Close()
 		ctx = withRateLimitOverride(ctx, req)
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
 			Caption:   a.Caption,
-			MediaPath: safePath,
+			Media:     m,
 			ViewOnce:  a.ViewOnce,
 		})
 		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)
 		return resultJSON(r)
 	}))
+}
+
+// mediaPathDesc describes media_path for the send tools.
+func mediaPathDesc(kind string) string {
+	return "absolute path to the " + kind + " on the daemon host; must sit under the outbound root: `WHATSAPP_MCP_OUTBOUND_ROOT` when set (a dedicated staging directory: stage an independent copy there first, not a link), otherwise the media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)"
 }
 
 // -- send_audio_message -----------------------------------------------------
@@ -108,9 +114,9 @@ type sendAudioArgs struct {
 
 func (s *Server) registerSendAudioMessage() {
 	tool := mcp.NewTool("send_audio_message",
-		mcp.WithDescription("Send an audio file as a WhatsApp voice note (waveform UI, push-to-play); non-ogg inputs are transcoded via ffmpeg before upload. Reversible via delete_message (revoke). Use send_file when you want the audio delivered as a regular attachment instead of a voice note. Prerequisites: ffmpeg must be on PATH for non-ogg inputs. Returns a JSON object `{Success, Message, ID}` where `ID` is the WhatsApp message ID on success."),
+		mcp.WithDescription("Send an audio file as a WhatsApp voice note (waveform UI, push-to-play); non-ogg inputs are transcoded via ffmpeg before upload. Reversible via delete_message (revoke). Use send_file when you want the audio delivered as a regular attachment instead of a voice note. Prerequisites: ffmpeg must be on PATH for non-ogg inputs. Returns a JSON object `{Success, Message, ID, FileSHA256, FileLength}` where `ID` is the WhatsApp message ID; `Uncertain: true` on a failure means WhatsApp did not confirm and the voice note may still have gone out."),
 		mcp.WithString("recipient", mcp.Required(), mcp.Description(recipientDesc)),
-		mcp.WithString("media_path", mcp.Required(), mcp.Description("absolute path to the audio file; must sit under the configured media root (`WHATSAPP_MCP_MEDIA_ROOT`, default `<store>/uploads/`)")),
+		mcp.WithString("media_path", mcp.Required(), mcp.Description(mediaPathDesc("audio file"))),
 		mcp.WithBoolean("mark_chat_read", mcp.DefaultBool(false), mcp.Description("if true, also ack recent incoming messages in the chat to clear the unread badge (defaults to false)")),
 		mcp.WithBoolean("view_once", mcp.DefaultBool(false), mcp.Description("if true, mark the voice note as view-once (defaults to false)")),
 		mcp.WithReadOnlyHintAnnotation(false),
@@ -123,22 +129,22 @@ func (s *Server) registerSendAudioMessage() {
 			return mcp.NewToolResultError("recipient and media_path are required"), nil
 		}
 		ctx = withRateLimitOverride(ctx, req)
-		safePath, err := s.client.ValidateMediaPath(a.MediaPath)
+		m, err := s.client.OpenOutboundMedia(a.MediaPath)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
-		path := safePath
-		if !strings.HasSuffix(strings.ToLower(path), ".ogg") {
-			converted, err := media.ConvertToOpusOgg(ctx, path)
+		defer m.Close()
+		if !strings.HasSuffix(strings.ToLower(m.Name), ".ogg") {
+			converted, err := media.ConvertToOpusOgg(ctx, m.Data, m.Name)
 			if err != nil {
 				return mcp.NewToolResultError(fmt.Sprintf("audio conversion failed: %v (install ffmpeg, or call send_file for raw audio)", err)), nil
 			}
-			defer os.Remove(converted)
-			path = converted
+			m.Data = converted
+			m.Name = strings.TrimSuffix(m.Name, filepath.Ext(m.Name)) + ".ogg"
 		}
 		r := s.client.SendMediaWithOptions(ctx, client.SendMediaOptions{
 			Recipient: a.Recipient,
-			MediaPath: path,
+			Media:     m,
 			ViewOnce:  a.ViewOnce,
 		})
 		s.maybeMarkChatRead(ctx, r, a.Recipient, a.MarkChatRead)

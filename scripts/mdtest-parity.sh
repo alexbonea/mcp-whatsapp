@@ -20,6 +20,7 @@ methods=(
   SendMessage
   Upload
   Download
+  SendMediaRetryReceipt
   GetGroupInfo
   BuildHistorySyncRequest
   MarkRead

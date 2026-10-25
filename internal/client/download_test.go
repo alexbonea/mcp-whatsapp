@@ -232,7 +232,7 @@ func TestDownload_InvalidCacheIsReplacedAfterValidatedDownload(t *testing.T) {
 	if err := s.StoreMessage(context.Background(), store.Message{
 		ID: msgID, ChatJID: jid, Sender: jid, Content: "x", Timestamp: time.Now().UTC(),
 		MediaType: "image", Filename: "photo.jpg", URL: "https://example.invalid/media", DirectPath: "/media",
-	}, []byte{1}, digest[:], []byte{2}, uint64(len(payload))); err != nil {
+	}, make([]byte, 32), digest[:], make([]byte, 32), uint64(len(payload))); err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join("store", jid, hex.EncodeToString([]byte(msgID)))

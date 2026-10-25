@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mdp/qrterminal"
@@ -15,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	wmstore "go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
@@ -48,6 +50,11 @@ type Client struct {
 	allowedMediaRoot string
 	redactor         *security.Redactor
 	limiter          *ratelimit.Limiter
+	// Protocol seam for offline tests; production uses SendMediaRetryReceipt.
+	sendMediaRetry    func(context.Context, *types.MessageInfo, []byte) error
+	mediaRetryMu      sync.Mutex
+	mediaRetries      map[mediaRetryKey]*mediaRetryCall
+	mediaRetryTimeout time.Duration // zero selects the 30-second default
 }
 
 // New constructs a Client. It sets the latest WhatsApp version best-effort,

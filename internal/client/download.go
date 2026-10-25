@@ -129,7 +129,7 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to inspect media cache: %v", statErr)}
 	}
 
-	if url == "" || len(mediaKey) == 0 || len(fileSHA256) == 0 || len(fileEncSHA256) == 0 || fileLength == 0 {
+	if (url == "" && directPath == "") || len(mediaKey) != 32 || len(fileSHA256) != 32 || len(fileEncSHA256) != 32 || fileLength == 0 {
 		return DownloadResult{Success: false, Message: "incomplete media information for download"}
 	}
 
@@ -159,16 +159,16 @@ func (c *Client) Download(ctx context.Context, messageID, chatJID, outputPath st
 		MediaType:     waMediaType,
 	}
 
-	var data []byte
-	if c.downloadMedia != nil {
-		data, err = c.downloadMedia(ctx, downloader)
-	} else if c.wa != nil {
-		data, err = c.wa.Download(ctx, downloader)
-	} else {
-		err = errors.New("media downloader is unavailable")
+	data, err := c.fetchMedia(ctx, downloader)
+	if isRecoverableMediaError(err) {
+		originalError := safeMediaError(err)
+		data, err = c.recoverMedia(ctx, messageID, chatJID, downloader)
+		if err != nil {
+			return DownloadResult{Success: false, Message: fmt.Sprintf("failed to download media: %v; phone recovery: %v", originalError, err)}
+		}
 	}
 	if err != nil {
-		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to download media: %v", err)}
+		return DownloadResult{Success: false, Message: fmt.Sprintf("failed to download media: %v", safeMediaError(err))}
 	}
 
 	if err := validateMediaPayload(data, fileLength, fileSHA256); err != nil {

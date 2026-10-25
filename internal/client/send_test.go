@@ -4,8 +4,44 @@ import (
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
+
+func TestDocumentAttachmentPreservesFilenameOnWire(t *testing.T) {
+	const path = "/private/uploads/Contract Brăila-v2.1.DOCX"
+	mediaType, mimeType := mediaTypeFromExt(path)
+	if mediaType != whatsmeow.MediaDocument {
+		t.Fatalf("DOCX classified as %q", mediaType)
+	}
+	msg := &waProto.Message{DocumentMessage: documentMessage(path, "Revizuit", mimeType, whatsmeow.UploadResponse{
+		URL: "https://example.invalid/media", DirectPath: "/media", FileLength: 42389,
+		FileSHA256: []byte{1, 2, 3}, MediaKey: []byte{4, 5, 6},
+	})}
+	wire, err := proto.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var received waProto.Message
+	if err := proto.Unmarshal(wire, &received); err != nil {
+		t.Fatal(err)
+	}
+	doc := received.GetDocumentMessage()
+	if doc.GetFileName() != "Contract Brăila-v2.1.DOCX" {
+		t.Fatalf("recipient filename = %q", doc.GetFileName())
+	}
+	if doc.GetMimetype() != "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+		t.Fatalf("recipient MIME type = %q", doc.GetMimetype())
+	}
+	if doc.GetCaption() != "Revizuit" || doc.GetFileLength() != 42389 || string(doc.GetFileSHA256()) != string([]byte{1, 2, 3}) {
+		t.Fatal("attachment metadata changed")
+	}
+	if _, got := mediaTypeFromExt("unknown.bin"); got != "application/octet-stream" {
+		t.Fatalf("unknown extension fallback = %q", got)
+	}
+}
 
 // TestParseRecipient covers the recipient-string → types.JID conversion used
 // by every send tool. The headline behaviour: a leading `+` on a bare phone

@@ -129,39 +129,45 @@ func PlaceholderWaveform(duration uint32) []byte {
 	return waveform
 }
 
-// ConvertToOpusOgg shells out to ffmpeg to convert any audio file to opus/ogg,
-// writing the output to a temp file. Returns the temp file path. The caller
-// is responsible for removing the file.
-func ConvertToOpusOgg(ctx context.Context, inputPath string) (outputPath string, err error) {
-	if _, lookErr := exec.LookPath("ffmpeg"); lookErr != nil {
-		return "", errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
+// ffmpegCommand is the converter binary; tests point it at a stub.
+var ffmpegCommand = "ffmpeg"
+
+// ConvertToOpusOgg transcodes audio bytes to opus/ogg with ffmpeg and
+// returns the result. name only contributes its extension, which helps
+// ffmpeg pick a demuxer.
+//
+// ffmpeg reads and writes inside a private directory (mode 0700) created
+// for this call under the user's temp directory and removed when the call
+// returns, on success and on failure alike. ffmpeg never sees a path the
+// caller chose, so a file name cannot inject options and the bytes
+// converted are exactly the ones the caller validated.
+func ConvertToOpusOgg(ctx context.Context, data []byte, name string) ([]byte, error) {
+	bin, lookErr := exec.LookPath(ffmpegCommand)
+	if lookErr != nil {
+		return nil, errors.New("ffmpeg not found on PATH; install ffmpeg to use voice messages")
 	}
 
-	tmp, err := os.CreateTemp("", "mcp-whatsapp-audio-*.ogg")
+	dir, err := os.MkdirTemp("", "mcp-whatsapp-audio-*")
 	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	tmpPath := tmp.Name()
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("failed to close temp file: %w", err)
+	defer os.RemoveAll(dir)
+
+	input := filepath.Join(dir, "input"+audioExt(name))
+	if err := os.WriteFile(input, data, 0o600); err != nil {
+		return nil, fmt.Errorf("failed to write temp input: %w", err)
 	}
+	output := filepath.Join(dir, "output.ogg")
 
-	// Flag-injection guard: ffmpeg treats any arg starting with `-` as a
-	// flag, so a file whose basename happens to start with `-` (e.g. from
-	// a malicious or malformed path that made it past media_path
-	// allowlisting) could inject options. Rewrite to `./<basename>` so the
-	// leading `.` forces ffmpeg to read it as a path.
-	safeInput := sanitizeFFmpegInputPath(inputPath)
-
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-i", safeInput,
+	cmd := exec.CommandContext(ctx, bin,
+		"-nostdin",
+		"-i", input,
 		"-c:a", "libopus",
 		"-b:a", "32k",
 		"-vbr", "on",
 		"-compression_level", "10",
 		"-y",
-		tmpPath,
+		output,
 	)
 	cmd.Env = minimalEnv()
 
@@ -169,41 +175,31 @@ func ConvertToOpusOgg(ctx context.Context, inputPath string) (outputPath string,
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(stderr.String()))
+		return nil, fmt.Errorf("ffmpeg conversion failed: %w: %s", err, sanitizeStderr(stderr.String()))
 	}
-
-	return tmpPath, nil
+	out, err := os.ReadFile(output)
+	if err != nil {
+		return nil, fmt.Errorf("read ffmpeg output: %w", err)
+	}
+	if len(out) == 0 {
+		return nil, errors.New("ffmpeg produced no output")
+	}
+	return out, nil
 }
 
-// sanitizeFFmpegInputPath rewrites paths whose basename begins with `-` so
-// that ffmpeg treats them as files rather than option flags. Absolute paths
-// pass through unchanged (they already begin with `/`); relative paths get a
-// `./` prefix when the basename would otherwise begin with `-`.
-//
-// Examples:
-//
-//	"/tmp/foo.mp3"      -> "/tmp/foo.mp3"
-//	"/tmp/-weird.mp3"   -> "/tmp/-weird.mp3"  (basename-leading-dash, absolute is safe)
-//	"-weird.mp3"        -> "./-weird.mp3"
-//	"./-weird.mp3"      -> "./-weird.mp3"
-func sanitizeFFmpegInputPath(p string) string {
-	if p == "" {
-		return p
+// audioExt returns name's extension if it is short and alphanumeric, so
+// the temp input keeps a hint for ffmpeg without carrying caller text.
+func audioExt(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if len(ext) < 2 || len(ext) > 6 {
+		return ""
 	}
-	// Absolute paths already start with `/` (or a drive letter on Windows,
-	// but we don't run on Windows), which ffmpeg parses as a filename.
-	if filepath.IsAbs(p) {
-		return p
+	for _, r := range ext[1:] {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') {
+			return ""
+		}
 	}
-	// Relative paths that already lead with `./` or `../` are fine.
-	if strings.HasPrefix(p, "./") || strings.HasPrefix(p, "../") {
-		return p
-	}
-	if strings.HasPrefix(p, "-") {
-		return "./" + p
-	}
-	return p
+	return ext
 }
 
 var safeEnvKeys = []string{"PATH", "TMPDIR", "TEMP", "TMP", "HOME"}

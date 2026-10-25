@@ -103,7 +103,37 @@ WHATSAPP_MCP_MEDIA_ROOT=/Users/me/whatsapp-shared ./bin/whatsapp-mcp serve
 
 Or add it to your launchd plist / systemd unit / shell profile so it persists across restarts.
 
-Paths outside the allowed root are rejected with a clear error so Claude can ask you to move the file or update the env var. Symlinks inside the root are resolved before the check, so a symlink that points out of the root is also rejected. Do not place secrets inside the allowed root — the allowlist bounds what the tool can read or write, but anything inside is fair game.
+Paths outside the allowed root are rejected with a clear error so Claude can ask you to move the file or update the env var. Files are opened through a descriptor confined to the root (Go's `os.Root`), so a symlink that points out of the root, or a parent directory swapped for one after the check, is also rejected; FIFOs, devices and directories are refused. Do not place secrets inside the allowed root — the allowlist bounds what the tool can read or write, but anything inside is fair game.
+
+`download_media` writes `output_path` as an independent copy (it no longer hard-links the cache), refuses an `output_path` that already exists as a symlink or other non-file, and only inlines image/audio bytes read from a regular file inside the root.
+
+#### Separate outbound root (`WHATSAPP_MCP_OUTBOUND_ROOT`)
+
+When the media root is a shared or synced folder (an inbox that receives downloads), sending from it means anything that lands there becomes sendable. Set `WHATSAPP_MCP_OUTBOUND_ROOT` to give sends their own root:
+
+```bash
+WHATSAPP_MCP_MEDIA_ROOT=/Users/me/inbox/whatsapp \
+WHATSAPP_MCP_OUTBOUND_ROOT=/Users/me/.local/state/whatsapp-mcp/outbound \
+  ./bin/whatsapp-mcp serve
+```
+
+- It becomes the **only** root `send_file` and `send_audio_message` read from; `WHATSAPP_MCP_MEDIA_ROOT` keeps governing `download_media`'s `output_path` and is no longer a send source. There is no fallback to the media root: re-sending a received file means staging a copy of it first.
+- It must be a dedicated private directory. `serve` creates it with mode `0700` if missing and refuses to start (exit 2) when the path is relative, is or contains your home directory, the store directory or a system temp directory, overlaps the media root, is not a directory, belongs to another user, or is accessible to group or others.
+- `media_path` must be absolute and name a regular file with a single hard link, so a link to a document elsewhere on the same disk is refused.
+- While a send runs, the daemon holds a shared `flock` on the file; it disappears with the descriptor when the send returns or the daemon stops.
+
+Without the variable, behaviour is unchanged: sends read the media root as before (hard-linked downloads included).
+
+`whatsapp-mcp outbound` manages copies in that root without credentials and without sending anything:
+
+```bash
+whatsapp-mcp outbound stage   -root DIR [-sha256 HEX] SOURCE      # private copy + JSON {op_dir, path, name, size, sha256}
+whatsapp-mcp outbound verify  -root DIR -sha256 HEX STAGED_PATH  # exit 0 only on a match
+whatsapp-mcp outbound cleanup -root DIR OP_DIR                    # move to the Trash; exit 3 while a send holds it
+whatsapp-mcp outbound sweep   -root DIR                           # recover orphans older than 24h
+```
+
+`stage` copies one regular file (following symlinks to its real location, never recursing into directories) into a fresh `0700` operation directory, keeps the file name, creates the copy `0600` with no shared inode, hashes the source before and during the copy and the copy afterwards, and discards the operation if anything differs. `-sha256` pins the authorised version. Before each copy it moves operation directories older than 24 hours that no send holds to the Trash; 24 hours is an eligibility threshold checked at the next use, not a deletion deadline, and Trash is not erasure. `send_file` results carry `FileSHA256`/`FileLength` of the uploaded bytes to compare with the staged copy, and `Uncertain: true` when WhatsApp did not confirm a send: the message may have gone out, so do not resend automatically. `cleanup` uses `trash` from `PATH` (`-trash CMD` to override).
 
 #### Sandboxed clients (Claude.ai with Cowork, etc.)
 
@@ -165,7 +195,8 @@ Flags and environment variables for `serve`:
 - `-addr host:port` (env `WHATSAPP_MCP_ADDR`, default `127.0.0.1:8765`).
 - `-allow-remote` (explicit opt-in to bind a non-loopback address; requires `WHATSAPP_MCP_TOKEN`).
 - `WHATSAPP_MCP_TOKEN` — bearer token for `/mcp` and `/pair/*` when `-allow-remote` is set. Required; `serve` exits if missing.
-- `WHATSAPP_MCP_MEDIA_ROOT` — allowed root for `send_file` / `send_audio_message` `media_path` and `download_media` `output_path`.
+- `WHATSAPP_MCP_MEDIA_ROOT` — allowed root for `download_media` `output_path`, and for `send_file` / `send_audio_message` `media_path` unless `WHATSAPP_MCP_OUTBOUND_ROOT` is set.
+- `WHATSAPP_MCP_OUTBOUND_ROOT` — dedicated `0700` root that becomes the only source for `media_path` (see [Separate outbound root](#separate-outbound-root-whatsapp_mcp_outbound_root)).
 - `WHATSAPP_MCP_DEBUG=1` — enable verbose logging with partial phone-number redaction (last 5 digits visible).
 
 ## Tools
@@ -266,6 +297,7 @@ Intentionally not exposed yet:
 - **Windows:** requires CGO and a C compiler — see [docs/windows.md](docs/windows.md).
 - **Upstream bounds:** message fetch/send is bounded by what [whatsmeow](https://github.com/tulir/whatsmeow) supports against the WhatsApp web multidevice API.
 - **Log redaction is obfuscation, not anonymisation.** Partial knowledge of your contacts allows correlation from the last 5 visible digits. Symlinks inside `./store/uploads/` are resolved before the path check so they cannot escape, but the root itself is a trust boundary — only place files you intend to send inside it.
+- **Path confinement is not process isolation.** The root checks stop the daemon from reading or writing outside its roots through paths, links or swaps. Any other process running as the same user can still read your files directly, and can hard-link files into the legacy media root.
 
 ## Development
 

@@ -10,6 +10,7 @@ internal/client/        whatsmeow client wrapper (send, download, events, histor
 internal/daemon/        HTTP server, pairing state machine, /pair endpoint
 internal/mcp/           mark3labs/mcp-go server + tool registrations
 internal/media/         ogg analysis + ffmpeg shell-out
+internal/outbound/      staging protocol for the outbound root (stage/verify/cleanup/sweep, in-flight lock)
 internal/security/      path allowlisting, filename sanitisation, log redaction
 internal/store/         SQLite cache + queries + LID resolution + formatters
 scripts/mdtest-parity.sh  whatsmeow API drift canary
@@ -22,6 +23,7 @@ Data lives under `./store/` (override with `-store DIR`). Binary is `bin/whatsap
 - `login` — pair the device via QR, write session to `store/whatsapp.db`.
 - `serve` — HTTP daemon on `127.0.0.1:<port>`; tracks events + serves MCP at `/mcp`; pairing UI at `/pair`. Holds `store/.lock` while running and is mutually exclusive with any other `serve` instance using the same store directory.
 - `smoke` — boot-test without connecting to WhatsApp.
+- `outbound` — `stage` / `verify` / `cleanup` / `sweep` document copies in `WHATSAPP_MCP_OUTBOUND_ROOT`; no credentials, never sends.
 
 ## Testing
 
@@ -58,6 +60,7 @@ Tool surface is 42 tools, registered from `internal/mcp/tools.go` + `tools_group
 7. **Blocklist** — also in `internal/client/features_groups.go`. `GetBlocklist`, `BlockContact`, `UnblockContact` wrap whatsmeow's `GetBlocklist` / `UpdateBlocklist`.
 8. **Polls + contact cards + view-once flag** — `internal/client/features_media.go` (poll send / vote / tally + contact-card send paths) plus `internal/client/vcard.go` (vCard 3.0 synthesis when no override supplied) and the `ViewOnce` option plumbed through `SendMediaOptions` in `internal/client/send.go`. `SendPoll` now uses `wa.BuildPollCreation` so the required `MessageSecret` is attached (without it, votes cannot be decrypted — this was silently broken before). Vote ingest + tally live in `internal/client/events.go::handlePollVote` and `internal/store/poll.go` (the new `poll_votes` table + `messages.poll_options_json` column).
 9. **Presence / privacy / status message** — `internal/client/features_privacy.go`. `SendPresence` (own availability), `GetPrivacySettings` / `SetPrivacySetting` with strict enum validation, `SetStatusMessage` for the "About" text.
+10. **Media roots** — `cmd/whatsapp-mcp/serve.go::resolveMediaRoots` + `internal/security/paths.go`. `WHATSAPP_MCP_MEDIA_ROOT` governs `download_media` output (and sends, in legacy mode); `WHATSAPP_MCP_OUTBOUND_ROOT`, when set, is the only send root (`security.PrepareDedicatedRoot` fails closed at startup). Every media file access goes through `os.Root` (`security.OpenRegular`, `security.Target`); `internal/client/outbound.go::OpenOutboundMedia` takes the in-flight `flock` that `internal/outbound` checks before cleanup.
 
 ## Versioning
 

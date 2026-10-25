@@ -5,7 +5,10 @@
 
   1. Copy this file to ~/Library/LaunchAgents/.
   2. Replace {{PATH_TO_REPO}} and {{STORE_DIR}} with absolute paths.
-  3. (Optional) adjust WHATSAPP_MCP_ADDR / WHATSAPP_MCP_MEDIA_ROOT / WHATSAPP_MCP_DEBUG.
+  3. (Optional) adjust WHATSAPP_MCP_ADDR / WHATSAPP_MCP_MEDIA_ROOT / WHATSAPP_MCP_DEBUG,
+     and add WHATSAPP_MCP_OUTBOUND_ROOT (a dedicated 0700 directory) to give
+     send_file its own root instead of the media root. Environment changes
+     need launchctl bootout + bootstrap; kickstart keeps the old values.
   4. launchctl load ~/Library/LaunchAgents/com.sealjay.whatsapp-mcp.plist
   5. On first install, open http://127.0.0.1:8765/pair in a browser.
 -->

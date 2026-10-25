@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -37,8 +38,10 @@ const inlineMediaMaxBytes = 5 * 1024 * 1024
 // Videos and documents are not embedded (too large or not renderable inline).
 // If the file is missing or oversized, the call still succeeds with just the
 // JSON block — the tool is still useful and the caller can fetch the file
-// out of band via Path.
-func downloadMediaResult(r client.DownloadResult) (*mcp.CallToolResult, error) {
+// out of band via Path. open must confine the read to the root the download
+// wrote into (see client.OpenDownloadedMedia), so a symlink at Path cannot
+// turn the inline block into a read of an unrelated file.
+func downloadMediaResult(r client.DownloadResult, open func(path string) (*os.File, error)) (*mcp.CallToolResult, error) {
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("marshal: %v", err)), nil
@@ -46,7 +49,7 @@ func downloadMediaResult(r client.DownloadResult) (*mcp.CallToolResult, error) {
 	contents := []mcp.Content{mcp.NewTextContent(string(b))}
 
 	if r.Success && (r.MediaType == "image" || r.MediaType == "audio") && r.Path != "" {
-		if inlined, ok := readInlineMedia(r.Path, r.MediaType); ok {
+		if inlined, ok := readInlineMedia(open, r.Path, r.MediaType); ok {
 			contents = append(contents, inlined)
 		}
 	}
@@ -60,16 +63,18 @@ func downloadMediaResult(r client.DownloadResult) (*mcp.CallToolResult, error) {
 // (resources.go) so we get the real format regardless of the filename
 // WhatsApp assigns (all photos are named `.jpg` even when the underlying
 // bytes are WebP, and all voice notes are named `.ogg`).
-func readInlineMedia(path, mediaType string) (mcp.Content, bool) {
-	info, err := os.Stat(path)
+func readInlineMedia(open func(string) (*os.File, error), path, mediaType string) (mcp.Content, bool) {
+	f, err := open(path)
 	if err != nil {
 		return nil, false
 	}
-	if info.Size() > inlineMediaMaxBytes {
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || info.Size() > inlineMediaMaxBytes {
 		return nil, false
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
+	data, err := io.ReadAll(io.LimitReader(f, inlineMediaMaxBytes+1))
+	if err != nil || len(data) > inlineMediaMaxBytes {
 		return nil, false
 	}
 	mimeType := sniffResourceMIME(data, mediaType)

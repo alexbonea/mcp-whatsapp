@@ -28,8 +28,13 @@ type Config struct {
 	StoreDir         string             // directory holding messages.db and whatsapp.db
 	Store            *store.Store       // initialized message store
 	Logger           waLog.Logger       // optional; defaults to stderr at INFO
-	AllowedMediaRoot string             // absolute path; media_path args must live under this
+	AllowedMediaRoot string             // absolute path; download_media output_path must live under this, and media_path too unless OutboundRoot is set
 	Redactor         *security.Redactor // optional; defaults to a redacting instance
+	// OutboundRoot, when set, replaces AllowedMediaRoot as the only root
+	// send_file and send_audio_message read from, with stricter rules
+	// (absolute paths, single-link files, mandatory in-flight lock). The
+	// caller validates it with security.PrepareDedicatedRoot.
+	OutboundRoot string
 	// RateLimiter throttles outbound sends and usync lookups. Optional; New
 	// installs one built from ratelimit.DefaultConfig when nil. Pass an
 	// explicitly-configured limiter to override the defaults, or leave the
@@ -48,6 +53,8 @@ type Client struct {
 	allowedMediaRoot string
 	redactor         *security.Redactor
 	limiter          *ratelimit.Limiter
+	outboundRoot     string
+	sender           waSender // nil means c.wa; tests substitute it
 }
 
 // New constructs a Client. It sets the latest WhatsApp version best-effort,
@@ -131,22 +138,15 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		allowedMediaRoot: cfg.AllowedMediaRoot,
 		redactor:         redactor,
 		limiter:          limiter,
+		outboundRoot:     cfg.OutboundRoot,
 	}, nil
 }
 
-// ValidateMediaPath is a bound convenience wrapper around
-// security.ValidateMediaPath that uses the client's configured allowlist
-// root. Callers inside internal/client and internal/mcp should prefer this
-// over calling the package-level helper directly.
-func (c *Client) ValidateMediaPath(userPath string) (string, error) {
-	return security.ValidateMediaPath(userPath, c.allowedMediaRoot)
-}
-
-// ValidateOutputPath is the sister wrapper for paths the daemon is about to
-// *write* to (e.g. download_media's output_path). Parent dir must exist; the
-// final file does not.
-func (c *Client) ValidateOutputPath(userPath string) (string, error) {
-	return security.ValidateOutputPath(userPath, c.allowedMediaRoot)
+// ResolveOutputPath validates a path the daemon is about to *write* to
+// (download_media's output_path) against the inbound media root. Parent
+// dir must exist; the final file does not.
+func (c *Client) ResolveOutputPath(userPath string) (*security.Target, error) {
+	return security.ResolveOutputPath(userPath, c.allowedMediaRoot)
 }
 
 // IsLoggedIn reports whether the underlying whatsmeow device has a stored

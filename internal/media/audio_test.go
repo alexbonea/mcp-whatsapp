@@ -138,33 +138,118 @@ func TestAnalyzeOggOpus_ValidSynthetic(t *testing.T) {
 	}
 }
 
-func TestSanitizeFFmpegInputPath(t *testing.T) {
-	cases := []struct {
-		in, want string
-	}{
-		{"/tmp/foo.mp3", "/tmp/foo.mp3"},
-		{"/tmp/-weird.mp3", "/tmp/-weird.mp3"}, // absolute: safe as-is
-		{"-weird.mp3", "./-weird.mp3"},         // bare leading dash: prefix
-		{"./-weird.mp3", "./-weird.mp3"},       // already prefixed
-		{"../foo/-weird.mp3", "../foo/-weird.mp3"},
-		{"foo.mp3", "foo.mp3"},
-		{"", ""},
+// stubFFmpeg installs a fake ffmpeg that records the directory it ran in
+// (with its mode) and either copies its input to its output or fails.
+func stubFFmpeg(t *testing.T, fail bool) (report string) {
+	t.Helper()
+	dir := t.TempDir()
+	report = filepath.Join(dir, "report")
+	body := `#!/bin/sh
+in=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i) in="$2"; shift ;;
+    *) out="$1" ;;
+  esac
+  shift
+done
+ls -ld "$(dirname "$in")" > "` + report + `"
+ls -l "$in" >> "` + report + `"
+echo "$in" >> "` + report + `"
+`
+	if fail {
+		body += "echo 'Invalid data found when processing input' >&2\nexit 1\n"
+	} else {
+		body += `cp "$in" "$out"` + "\n"
 	}
-	for _, tc := range cases {
-		got := sanitizeFFmpegInputPath(tc.in)
-		if got != tc.want {
-			t.Errorf("sanitizeFFmpegInputPath(%q) = %q; want %q", tc.in, got, tc.want)
+	bin := filepath.Join(dir, "fake-ffmpeg")
+	if err := os.WriteFile(bin, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	old := ffmpegCommand
+	ffmpegCommand = bin
+	t.Cleanup(func() { ffmpegCommand = old })
+	return report
+}
+
+// readReport returns the stub's view of the temp directory: its mode line,
+// the input file's mode line and the input path.
+func readReport(t *testing.T, report string) (dirMode, fileMode, input string) {
+	t.Helper()
+	b, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("stub ffmpeg did not run: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("report = %q", b)
+	}
+	return lines[0], lines[1], lines[2]
+}
+
+func TestConvertToOpusOgg_PrivateTempRemovedOnSuccess(t *testing.T) {
+	report := stubFFmpeg(t, false)
+	out, err := ConvertToOpusOgg(context.Background(), []byte("RIFF-voice"), "-sneaky name.mp3")
+	if err != nil {
+		t.Fatalf("ConvertToOpusOgg: %v", err)
+	}
+	if string(out) != "RIFF-voice" {
+		t.Fatalf("output %q", out)
+	}
+	dirMode, fileMode, input := readReport(t, report)
+	if !strings.HasPrefix(dirMode, "drwx------") || !strings.HasPrefix(fileMode, "-rw-------") {
+		t.Fatalf("temp modes: %q / %q", dirMode, fileMode)
+	}
+	// The caller's file name never reaches ffmpeg, only its extension.
+	if filepath.Base(input) != "input.mp3" || !filepath.IsAbs(input) {
+		t.Fatalf("ffmpeg input %q", input)
+	}
+	if _, err := os.Stat(filepath.Dir(input)); !os.IsNotExist(err) {
+		t.Fatalf("temp dir left behind after success: %v", err)
+	}
+}
+
+func TestConvertToOpusOgg_PrivateTempRemovedOnFailure(t *testing.T) {
+	report := stubFFmpeg(t, true)
+	_, err := ConvertToOpusOgg(context.Background(), []byte("garbage"), "note.m4a")
+	if err == nil || !strings.Contains(err.Error(), "ffmpeg conversion failed") {
+		t.Fatalf("want conversion failure, got %v", err)
+	}
+	_, _, input := readReport(t, report)
+	if strings.Contains(err.Error(), input) {
+		t.Fatalf("error leaks the temp path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(input)); !os.IsNotExist(err) {
+		t.Fatalf("temp dir left behind after failure: %v", err)
+	}
+}
+
+func TestConvertToOpusOgg_MissingFFmpeg(t *testing.T) {
+	old := ffmpegCommand
+	ffmpegCommand = filepath.Join(t.TempDir(), "no-such-ffmpeg")
+	t.Cleanup(func() { ffmpegCommand = old })
+	_, err := ConvertToOpusOgg(context.Background(), []byte("x"), "a.mp3")
+	if err == nil || !strings.Contains(err.Error(), "ffmpeg") {
+		t.Fatalf("expected error mentioning ffmpeg, got %v", err)
+	}
+}
+
+func TestAudioExt(t *testing.T) {
+	cases := map[string]string{
+		"a.MP3": ".mp3", "voice.m4a": ".m4a", "noext": "", "x.tar.gz": ".gz",
+		"evil.-i": "", "long.abcdefgh": "", "a.b c": "", "dots.": "",
+	}
+	for in, want := range cases {
+		if got := audioExt(in); got != want {
+			t.Errorf("audioExt(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
-func TestConvertToOpusOgg_RejectsFlagLikeBasename(t *testing.T) {
-	// End-to-end: create a temp file whose basename begins with `-`. If
-	// ffmpeg is available and we did NOT sanitise the path, ffmpeg would
-	// reject it with "Unrecognized option"; with the sanitiser it reads
-	// the file normally.
+// TestConvertToOpusOgg runs the real ffmpeg when it is installed.
+func TestConvertToOpusOgg(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		t.Skip("ffmpeg not available; skipping flag-injection guard test")
+		t.Skip("ffmpeg not available; the stub tests cover the temp-file handling")
 	}
 	if fixturePath == "" {
 		t.Skip("ffmpeg present but fixture generation failed; skipping")
@@ -173,69 +258,12 @@ func TestConvertToOpusOgg_RejectsFlagLikeBasename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	tmpDir, err := os.MkdirTemp("", "mcp-whatsapp-flag-guard-*")
-	if err != nil {
-		t.Fatalf("mktemp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-	// Use a relative path so the leading dash is actually at the
-	// beginning of the arg ffmpeg sees.
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	defer func() { _ = os.Chdir(cwd) }()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	dangerous := "-sneaky.ogg"
-	if err := os.WriteFile(dangerous, src, 0o644); err != nil {
-		t.Fatalf("write fixture copy: %v", err)
-	}
-	out, err := ConvertToOpusOgg(context.Background(), dangerous)
-	if err != nil {
-		t.Fatalf("ConvertToOpusOgg with dash-prefixed basename: %v", err)
-	}
-	defer os.Remove(out)
-	info, err := os.Stat(out)
-	if err != nil {
-		t.Fatalf("stat output: %v", err)
-	}
-	if info.Size() == 0 {
-		t.Fatalf("expected non-empty output, got size 0")
-	}
-}
-
-func TestConvertToOpusOgg(t *testing.T) {
-	ctx := context.Background()
-	if _, err := exec.LookPath("ffmpeg"); err != nil {
-		// Without ffmpeg, ConvertToOpusOgg must error out with a message
-		// mentioning ffmpeg.
-		_, convErr := ConvertToOpusOgg(ctx, "/nonexistent/input.mp3")
-		if convErr == nil {
-			t.Fatal("expected error when ffmpeg is missing")
-		}
-		if !strings.Contains(convErr.Error(), "ffmpeg") {
-			t.Fatalf("expected error mentioning ffmpeg, got %v", convErr)
-		}
-		return
-	}
-
-	if fixturePath == "" {
-		t.Skip("ffmpeg present but fixture generation failed; skipping")
-	}
-	out, err := ConvertToOpusOgg(ctx, fixturePath)
+	out, err := ConvertToOpusOgg(context.Background(), src, "-dash-leading.ogg")
 	if err != nil {
 		t.Fatalf("ConvertToOpusOgg: %v", err)
 	}
-	defer os.Remove(out)
-
-	info, err := os.Stat(out)
-	if err != nil {
-		t.Fatalf("stat output: %v", err)
-	}
-	if info.Size() == 0 {
-		t.Fatalf("expected non-empty output file, got size 0")
+	if _, _, err := AnalyzeOggOpus(out); err != nil {
+		t.Fatalf("output is not ogg: %v", err)
 	}
 }
 
@@ -272,14 +300,15 @@ func TestConvertToOpusOgg_EnvIsolation(t *testing.T) {
 	const sentinel = "MCP_WHATSAPP_TEST_SENTINEL_12345"
 	t.Setenv(sentinel, "should-not-reach-ffmpeg")
 
-	out, err := ConvertToOpusOgg(context.Background(), fixturePath)
+	src, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	out, err := ConvertToOpusOgg(context.Background(), src, "in.ogg")
 	if err != nil {
 		t.Fatalf("ConvertToOpusOgg: %v", err)
 	}
-	defer os.Remove(out)
-
-	info, err := os.Stat(out)
-	if err != nil || info.Size() == 0 {
-		t.Fatalf("expected valid output file after env-isolated run, stat=%v size=%d", err, info.Size())
+	if len(out) == 0 {
+		t.Fatal("expected output after env-isolated run")
 	}
 }

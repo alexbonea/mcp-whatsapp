@@ -64,7 +64,10 @@ func (l recordingLogger) dump() string {
 // a2381054887e acknowledges it.
 //
 // With no socket the acknowledgement cannot be sent, so whatsmeow logs the
-// failed attempt; that log line is the observable proof that it tried.
+// failed attempt; that log line is the observable proof that it tried. A
+// stanza whatsmeow fails to parse is also answered, but with a parse-error
+// NACK logged as "Failed to parse message" first, so the test rejects that
+// line to make sure a well-formed <status> gets a plain acknowledgement.
 func TestWhatsmeowAcksStatusNodes(t *testing.T) {
 	log := newRecordingLogger()
 	ownID := types.NewADJID("40700000000", 0, 1)
@@ -97,5 +100,8 @@ func TestWhatsmeowAcksStatusNodes(t *testing.T) {
 			t.Fatalf("whatsmeow did not try to acknowledge a <status> node; log:\n%s", log.dump())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if log.contains("Failed to parse message") {
+		t.Fatalf("whatsmeow rejected a well-formed <status> node with a parse-error NACK; log:\n%s", log.dump())
 	}
 }
